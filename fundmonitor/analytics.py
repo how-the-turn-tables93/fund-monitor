@@ -1,6 +1,7 @@
 """Peer-rank, benchmark and consistency analytics on a monthly date grid."""
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -9,7 +10,8 @@ import pandas as pd
 from . import benchmarks as bm
 from .navs import fetch_many
 
-N_GRID = 61      # as_of minus 0..60 months
+warnings.filterwarnings("ignore", message="All-NaN slice")
+N_GRID = 61     # as_of minus 0..60 months
 N_ROLL = 36      # rolling 1Y windows measured (monthly steps)
 MIN_PEERS = 5    # minimum peers for a percentile rank to be meaningful
 TOL = 0.0025     # excess return smaller than 0.25pp (~passive tracking noise) counts as "in line"
@@ -36,7 +38,46 @@ def returns_from_grid(P: np.ndarray) -> dict:
         r = P[:, 0] / P[:, m] - 1
         out[h] = (1 + r) ** (12 / m) - 1 if m > 12 else r
     out["roll"] = P[:, :N_ROLL] / P[:, 12:12 + N_ROLL] - 1
+    out["roll6"] = P[:, :N_ROLL] / P[:, 6:6 + N_ROLL] - 1                    # rolling 6M windows
+    out["roll3"] = (P[:, :N_GRID - 36] / P[:, 36:]) ** (1 / 3) - 1           # rolling 3Y windows (annualised)
     return out
+
+
+def _dd_values(v: np.ndarray) -> tuple[float, float]:
+    """(max drawdown, point return) of a value path."""
+    v = np.asarray(v, dtype=float)
+    v = v[~np.isnan(v)]
+    if len(v) < 3:
+        return np.nan, np.nan
+    return float((v / np.maximum.accumulate(v) - 1).min()), float(v[-1] / v[0] - 1)
+
+
+def dd_window(s: pd.Series, as_of: pd.Timestamp, days: int) -> tuple[float, float]:
+    start = as_of - pd.Timedelta(days=days)
+    w = pd.concat([s[s.index <= start].iloc[-1:], s[(s.index > start) & (s.index <= as_of)]])
+    return _dd_values(w.to_numpy())
+
+
+def dd_blend(parts: list[tuple[pd.Series, float]], as_of: pd.Timestamp, days: int) -> tuple[float, float]:
+    start = as_of - pd.Timedelta(days=days)
+    cols = []
+    for s, w in parts:
+        x = pd.concat([s[s.index <= start].iloc[-1:], s[(s.index > start) & (s.index <= as_of)]])
+        cols.append(x.pct_change() * w)
+    r = pd.concat(cols, axis=1).sort_index().ffill().fillna(0).sum(axis=1)
+    return _dd_values(np.concatenate([[1.0], (1 + r.iloc[1:]).cumprod().to_numpy()]))
+
+
+def _shares(pct: np.ndarray, min_n: int = 1) -> dict:
+    v = ~np.isnan(pct)
+    n = v.sum(1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        d = {"n": n,
+             "bh": ((pct < 0.5) & v).sum(1) / n, "bq": ((pct < 0.25) & v).sum(1) / n,
+             "th": ((pct >= 0.5) & v).sum(1) / n, "tq": ((pct >= 0.75) & v).sum(1) / n}
+    for k in ("bh", "bq", "th", "tq"):
+        d[k] = np.where(n >= min_n, d[k], np.nan)
+    return d
 
 
 def pct_rank(M: np.ndarray) -> np.ndarray:
@@ -60,15 +101,25 @@ def blend_grid(parts: list[tuple[np.ndarray, float]]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------- group metrics
-def group_metrics(P: np.ndarray, bench: dict | None) -> dict:
+def group_metrics(P: np.ndarray, bench: dict | None, dd: dict | None = None,
+                  bench_dd: dict | None = None) -> dict:
     """Metrics for every fund in one peer group. `bench` = returns dict for the benchmark
-    (1-row arrays) or None to use the peer median."""
+    (1-row arrays) or None to use the peer median. `dd` = per-fund drawdown arrays
+    {'dd_1m','ret_1m','dd_3m'}; `bench_dd` = benchmark drawdowns (None -> peer median)."""
     R = returns_from_grid(P)
     if bench is None:
-        B = {k: np.nanmedian(v, axis=0) if k == "roll" else np.nanmedian(v) for k, v in R.items()}
+        B = {k: np.nanmedian(v, axis=0) if v.ndim == 2 else np.nanmedian(v) for k, v in R.items()}
     else:
-        B = {k: (v[0] if k == "roll" else v[0]) for k, v in bench.items()}
+        B = {k: v[0] for k, v in bench.items()}
     m = {"n_peers": np.full(len(P), len(P))}
+    if dd is not None:
+        for w in ("1m", "3m"):
+            x = dd[f"dd_{w}"]
+            bx = np.nanmedian(x) if bench_dd is None else bench_dd[f"dd_{w}"]
+            m[f"dd_{w}"] = x
+            m[f"bdd_{w}"] = np.full(len(P), bx)
+            m[f"ddp_{w}"] = pct_rank(x)          # 0 = deepest fall in the category
+        m["ret_1m"] = dd["ret_1m"]
     for h in HORIZONS:
         m[f"ret_{h}"] = R[h]
         m[f"bench_{h}"] = np.full(len(P), B[h])
@@ -87,6 +138,11 @@ def group_metrics(P: np.ndarray, bench: dict | None) -> dict:
         m["sh_tq"] = ((pct >= 0.75) & v_rank).sum(1) / n_rank
         m["sh_lag"] = ((exc < -TOL) & v_exc).sum(1) / n_exc
         m["sh_lead"] = ((exc > TOL) & v_exc).sum(1) / n_exc
+    for tag, key, min_n in (("6", "roll6", 12), ("3y", "roll3", 12)):
+        sh = _shares(pct_rank(R[key]), min_n)
+        m[f"n_{tag}"] = sh["n"]
+        for k in ("bh", "bq", "th", "tq"):
+            m[f"sh{tag}_{k}"] = sh[k]
     p5 = np.where(np.isnan(m["pct_5y"]), m["pct_3y"], m["pct_5y"])
     m["score"] = (0.30 * m["pct_3y"] + 0.25 * m["pct_1y"] + 0.15 * p5 + 0.30 * m["sh_th"])
     m["_roll_pct"], m["_roll_exc"] = pct, exc
@@ -139,7 +195,7 @@ def run_analysis(holdings: pd.DataFrame, uni: pd.DataFrame, progress=None) -> Re
         if pg.empty:
             continue
         P = np.vstack([to_grid(navs[c], dates) for c in pg["code"]])
-        bench, label, source = None, "Peer median (no passive proxy available)", "median"
+        bench, label, source, bdd = None, "Peer median (no passive proxy available)", "median", None
         if g.startswith("Passive"):
             label = "Peer median (same tracked index)"
         spec = specs[g]
@@ -148,22 +204,30 @@ def run_analysis(holdings: pd.DataFrame, uni: pd.DataFrame, progress=None) -> Re
                 if k in resolved:
                     bench = returns_from_grid(to_grid(resolved[k][2], dates))
                     label, source = bm.PROXIES[k][0], resolved[k][1]
+                    bdd = {"dd_1m": dd_window(resolved[k][2], as_of, 30)[0],
+                           "dd_3m": dd_window(resolved[k][2], as_of, 91)[0]}
                     break
         elif spec[0] == "blend":
-            parts = []
+            parts, daily = [], []
             for keys, w in spec[1]:
                 k = next((k for k in keys if k in resolved), None)
                 if k is None:
                     parts = None
                     break
                 parts.append((to_grid(resolved[k][2], dates), w))
+                daily.append((resolved[k][2], w))
             if parts:
+                bdd = {"dd_1m": dd_blend(daily, as_of, 30)[0], "dd_3m": dd_blend(daily, as_of, 91)[0]}
                 bench = returns_from_grid(blend_grid(parts))
                 label = spec[2]
                 source = " | ".join(next(resolved[k][1] for k in keys if k in resolved) for keys, _ in spec[1])
         if bench is not None and np.isnan(bench["1y"][0]):
-            bench, label, source = None, "Peer median (proxy lacked history)", "median"
-        met = group_metrics(P, bench)
+            bench, label, source, bdd = None, "Peer median (proxy lacked history)", "median", None
+        w1 = [dd_window(navs[c], as_of, 30) for c in pg["code"]]
+        w3 = [dd_window(navs[c], as_of, 91) for c in pg["code"]]
+        dd = {"dd_1m": np.array([x[0] for x in w1]), "ret_1m": np.array([x[1] for x in w1]),
+              "dd_3m": np.array([x[0] for x in w3])}
+        met = group_metrics(P, bench, dd, bdd)
         roll_pct, roll_exc = met.pop("_roll_pct"), met.pop("_roll_exc")
         df = pd.DataFrame(met)
         df.insert(0, "code", pg["code"].to_numpy())
@@ -172,6 +236,7 @@ def run_analysis(holdings: pd.DataFrame, uni: pd.DataFrame, progress=None) -> Re
         df.insert(3, "group", g)
         df.insert(4, "asset", pg["asset"].to_numpy())
         df["first_nav"] = [navs[c].index[0] for c in pg["code"]]
+        df["age_m"] = (as_of - df["first_nav"]).dt.days / 30.44
         frames.append(df)
         for i, c in enumerate(pg["code"]):
             rolls[int(c)] = (roll_pct[i], roll_exc[i])
@@ -222,9 +287,39 @@ def classify(df: pd.DataFrame, p: Params) -> pd.Series:
     s[rec_under] = "Recent underperformer (watch)"
     s[cons_under] = "Consistent underperformer (exit)"
     s[df["pct_1y"].isna() & df["ret_1y"].notna()] = "Not ranked (too few peers)"
+
+    # New funds: too little history for rolling windows. Soft flag from whichever of 3M/6M/1Y exist.
+    new = ~enough & df["age_m"].notna()
+    avail = df[["pct_3m", "pct_6m", "pct_1y"]]
+    n_av = avail.notna().sum(axis=1)
+    all_low = ((avail.fillna(1) < 0.25) | avail.isna()).all(axis=1)
+    all_high = ((avail.fillna(1) >= 0.75) | avail.isna()).all(axis=1)
+    s[new] = "New fund - neutral"
+    s[new & (df["age_m"] < 6)] = "New fund - deploying (<6M)"
+    s[new & (df["age_m"] < 3)] = "New fund - too new (<3M)"
+    s[new & (n_av >= 2) & all_high] = "New fund - strong"
+    s[new & (n_av >= 2) & all_low] = "New fund - watch"
+    s[df["age_m"].isna()] = "No NAV data"
     if p.exclude_cash:
-        s[df["group"].isin(CASH_GROUPS)] = "Not assessed (cash-like)"
+        s[df["group"].isin(CASH_GROUPS) & ~s.eq("No NAV data")] = "Not assessed (cash-like)"
     return s
+
+
+def momentum_badge(df: pd.DataFrame, status: pd.Series) -> pd.Series:
+    """Short-term (3M & 6M) context for the long-term lists."""
+    rec = ((df["pct_3m"] >= 0.5) & (df["pct_6m"] >= 0.5) & (df["ex_3m"] > TOL) & (df["ex_6m"] > TOL))
+    fade = ((df["pct_3m"] < 0.5) & (df["pct_6m"] < 0.5) & (df["ex_3m"] < -TOL) & (df["ex_6m"] < -TOL))
+    out = pd.Series("", index=df.index)
+    out[status == "Consistent underperformer (exit)"] = "Still weak"
+    out[(status == "Consistent underperformer (exit)") & rec] = "Recovering"
+    out[status == "Consistent outperformer"] = "Holding up"
+    out[(status == "Consistent outperformer") & fade] = "Fading"
+    return out
+
+
+def sharp_fall(df: pd.DataFrame, window: str = "1m", min_dd: float = 0.03) -> pd.Series:
+    """Deep drawdown in the category's worst 10% and worse than the benchmark's drawdown."""
+    return (df[f"ddp_{window}"] < 0.10) & (df[f"dd_{window}"] < df[f"bdd_{window}"]) & (df[f"dd_{window}"] <= -min_dd)
 
 
 # ----------------------------------------------------------------- replacements
