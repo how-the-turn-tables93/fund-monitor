@@ -24,8 +24,8 @@ def grid_dates(as_of: pd.Timestamp) -> pd.DatetimeIndex:
 
 def to_grid(s: pd.Series, dates: pd.DatetimeIndex) -> np.ndarray:
     asc = dates.sort_values()
-    v = s.reindex(s.index.union(asc)).ffill().reindex(asc).to_numpy(dtype=float)
-    v[asc < s.index[0]] = np.nan
+    v = np.array(s.reindex(s.index.union(asc)).ffill().reindex(asc), dtype=float)  # writable copy (pandas 3)
+    v[np.asarray(asc < s.index[0])] = np.nan
     return v[::-1]  # index k = as_of - k months
 
 
